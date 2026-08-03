@@ -2,6 +2,11 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -26,10 +31,14 @@ class TaskSystemSerial: public ITaskSystem {
  * of the ITaskSystem interface.
  */
 class TaskSystemParallelSpawn: public ITaskSystem {
+    private:
+        int num_threads;
+        std::vector<std::thread> workers;
     public:
         TaskSystemParallelSpawn(int num_threads);
         ~TaskSystemParallelSpawn();
         const char* name();
+        void workerStart(IRunnable* runnable, int start, int tasks_per_thread, int num_total_tasks);
         void run(IRunnable* runnable, int num_total_tasks);
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
@@ -43,10 +52,18 @@ class TaskSystemParallelSpawn: public ITaskSystem {
  * documentation of the ITaskSystem interface.
  */
 class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
+    private:
+        std::atomic<int> active;
+        std::atomic<int> finished;
+        int num_threads;
+        std::vector<std::thread> workers;
+        std::vector<std::pair<int, int>> work_queues;
+        std::vector<std::mutex> work_queue_locks;
     public:
         TaskSystemParallelThreadPoolSpinning(int num_threads);
         ~TaskSystemParallelThreadPoolSpinning();
         const char* name();
+        void workerStart(IRunnable* runnable, int thread_id, int num_total_tasks);
         void run(IRunnable* runnable, int num_total_tasks);
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
