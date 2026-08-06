@@ -354,6 +354,7 @@ void TaskSystemParallelThreadPoolSpinning::workerStart(int thread_id) {
             spin_cnt.fetch_add(1, std::memory_order_release);
             while (unfinished.load(std::memory_order_acquire) == 0) {
                 if (exit.load(std::memory_order_acquire)) return;
+                std::this_thread::yield();
             } // Spinning
             spin_cnt.fetch_sub(1, std::memory_order_release); // Next run (DON'T set it to 0 in run()!!!)
         }   // This is very important!!! Otherwise, when run is called again,
@@ -404,10 +405,14 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
                 this, thread_id);
 
     // If not finish, block the main thread
-    while (unfinished.load(std::memory_order_acquire) != 0) {} // Spinning
+    while (unfinished.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    } // Spinning
 
     // Simulate join
-    while (spin_cnt.load(std::memory_order_acquire) != num_threads) {}
+    while (spin_cnt.load(std::memory_order_acquire) != num_threads) {
+        std::this_thread::yield();
+    }
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
