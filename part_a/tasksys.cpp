@@ -108,7 +108,7 @@ void TaskSystemParallelSpawn::workerStart(IRunnable* runnable, int thread_id, in
         }
 
         // Steal
-        int victim = rand() % num_threads;
+        int victim = (thread_id + 1) % num_threads;
         for (int _ = 0; _ < num_threads; ++_) { // iterate at most num_threads times
             // A fast lookup: if victim's work queue is empty, choose next victim
             if (work_queues[victim].second == work_queues[victim].first) {
@@ -298,7 +298,7 @@ void TaskSystemParallelThreadPoolSpinning::finishWork(int thread_id) {
 void TaskSystemParallelThreadPoolSpinning::stealDoWork(int thread_id) {
     if (unfinished.load(std::memory_order_acquire) == 0) return;
 
-    int victim = rand() % num_threads;
+    int victim = (thread_id + 1) % num_threads;
     for (int _ = 0; _ < num_threads; ++_) { // iterate at most num_threads times
         // A fast lookup: if victim's work queue is empty, choose next victim
         if (work_queues[victim].end == work_queues[victim].start) {
@@ -495,7 +495,7 @@ void TaskSystemParallelThreadPoolSleeping::finishWork(int thread_id) {
 void TaskSystemParallelThreadPoolSleeping::stealDoWork(int thread_id) {
     if (unfinished.load(std::memory_order_acquire) == 0) return;
 
-    int victim = rand() % num_threads;
+    int victim = (thread_id + 1) % num_threads;
     for (int _ = 0; _ < num_threads; ++_) { // iterate at most num_threads times
         // A fast lookup: if victim's work queue is empty, choose next victim
         if (work_queues[victim].end == work_queues[victim].start) {
