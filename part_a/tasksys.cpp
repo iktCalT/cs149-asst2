@@ -13,8 +13,9 @@
 
 #define DEBUG_1 0
 #define DEBUG_2 0
+#define DEBUG_3 0
 
-#if DEBUG_1 || DEBUG_2
+#if DEBUG_1 || DEBUG_2 || DEBUG_3
 std::mutex print_mtx;
 #endif
 
@@ -81,7 +82,7 @@ TaskSystemParallelSpawn::TaskSystemParallelSpawn(int num_threads): ITaskSystem(n
 TaskSystemParallelSpawn::~TaskSystemParallelSpawn() {}
 
 void TaskSystemParallelSpawn::workerStart(IRunnable* runnable, int thread_id, int num_total_tasks) {
-    while (active != finished) {
+    while (unfinished.load(std::memory_order_acquire) != 0) {
         // Finish my work
         while (work_queues[thread_id].first != work_queues[thread_id].second) {
             work_queue_locks[thread_id].lock();
@@ -94,7 +95,7 @@ void TaskSystemParallelSpawn::workerStart(IRunnable* runnable, int thread_id, in
             int task_id = work_queues[thread_id].first;
             ++work_queues[thread_id].first;
             if (work_queues[thread_id].first == work_queues[thread_id].second) 
-                finished.fetch_add(1);
+                unfinished.fetch_sub(1);
             // unlock before executing tasks
             work_queue_locks[thread_id].unlock();
 
@@ -127,16 +128,13 @@ void TaskSystemParallelSpawn::workerStart(IRunnable* runnable, int thread_id, in
             int steal_size = (size + 1) / 2;
             int second = work_queues[victim].second;
             work_queues[victim].second -= steal_size;
-            active.fetch_add(1); // since size > 0, steal_size > 0, active must add 1
-                // Important: add active before adding finished and unlock!
-                // Otherwise, other threads may exit in advance!
-            if (steal_size == size) finished.fetch_add(1);
+            if (steal_size != size) unfinished.fetch_add(1);
         #if DEBUG_1
             print_mtx.lock();
-            printf("Thread %d steals from thread %d: Victim from [%d, %d) to [%d, %d). active: %d finished %d\n",
+            printf("Thread %d steals from thread %d: Victim from [%d, %d) to [%d, %d).\n",
                 thread_id, victim,
                 work_queues[victim].first, work_queues[victim].second + steal_size,
-                work_queues[victim].first, work_queues[victim].second, active.load(), finished.load());
+                work_queues[victim].first, work_queues[victim].second);
             print_mtx.unlock();
         #endif
             // Unlock before getting new lock to avoid dead lock
@@ -205,11 +203,10 @@ void TaskSystemParallelSpawn::run(IRunnable* runnable, int num_total_tasks) {
             ++non_empty_queues;
     }
 
-    active.store(non_empty_queues); 
-        // Important: cannot use active.store(num_threads), because some 
+    unfinished.store(non_empty_queues); 
+        // Important: cannot use unfinished.store(num_threads), because some 
         // threads may not have work initially. For example, num_threads 
-        // == 16, but num_total_tasks == 3. active should be 3
-    finished.store(0);
+        // == 4, but num_total_tasks == 5. -> [2,2,1,0] -> unfinished = 3
 
     // Spawn threads after complete work queues
     for (int thread_id = 1; thread_id < num_threads; ++thread_id) {
@@ -257,15 +254,11 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
     //
     this->num_threads = num_threads;
     workers.reserve(num_threads);
-    exit = false;
-    runnable = nullptr;
-    unfinished.store(0);
     work_queues = std::vector<WorkQueue>(num_threads);
-    join_count.store(0);
 }
 
 TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-    exit = true;
+    exit.store(true);
     for (int thread_id = 0; thread_id < num_threads; ++thread_id)
         if (workers[thread_id].joinable())
             workers[thread_id].join();
@@ -358,11 +351,11 @@ void TaskSystemParallelThreadPoolSpinning::stealDoWork(int thread_id) {
 void TaskSystemParallelThreadPoolSpinning::workerStart(int thread_id) {
     while (true) {
         if (unfinished.load(std::memory_order_acquire) == 0) {
-            join_count.fetch_add(1, std::memory_order_release);
+            spin_cnt.fetch_add(1, std::memory_order_release);
             while (unfinished.load(std::memory_order_acquire) == 0) {
-                if (exit) return;
+                if (exit.load(std::memory_order_acquire)) return;
             } // Spinning
-            join_count.fetch_sub(1, std::memory_order_release); // Next run (DON'T set it to 0 in run()!!!)
+            spin_cnt.fetch_sub(1, std::memory_order_release); // Next run (DON'T set it to 0 in run()!!!)
         }   // This is very important!!! Otherwise, when run is called again,
             // it may start stealing and lose its unfinished work!!!! I spent 
             // days on this bug!
@@ -414,7 +407,7 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     while (unfinished.load(std::memory_order_acquire) != 0) {} // Spinning
 
     // Simulate join
-    while (join_count.load(std::memory_order_acquire) != num_threads) {}
+    while (spin_cnt.load(std::memory_order_acquire) != num_threads) {}
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
@@ -445,6 +438,9 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    this->num_threads = num_threads;
+    workers.reserve(num_threads);
+    work_queues = std::vector<WorkQueue>(num_threads);
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
@@ -454,6 +450,137 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+
+#if DEBUG_3
+    printf("Destructor called.\n");
+#endif
+    exit.store(true);
+    worker_cv.notify_all();
+    for (int thread_id = 0; thread_id < num_threads; ++thread_id)
+        if (workers[thread_id].joinable())
+            workers[thread_id].join();
+}
+
+void TaskSystemParallelThreadPoolSleeping::finishWork(int thread_id) {
+    // Finish my work
+    if (unfinished.load(std::memory_order_acquire) == 0
+        || work_queues[thread_id].start == work_queues[thread_id].end) return;
+
+    while (true) {
+        work_queues[thread_id].lock.lock();
+        if (work_queues[thread_id].start == work_queues[thread_id].end) {
+            // Incase work is stolen before locking
+            work_queues[thread_id].lock.unlock();
+            break;
+        }
+
+        int task_id = work_queues[thread_id].start++;
+        if (work_queues[thread_id].start == work_queues[thread_id].end)
+            unfinished.fetch_sub(1, std::memory_order_release);
+    #if DEBUG_3
+        print_mtx.lock();
+        printf("Thread %d is running %p, task id: %d, total tasks: %d\n", 
+            thread_id, runnable, task_id, num_total_tasks);
+        print_mtx.unlock();
+    #endif
+        // unlock before executing tasks
+        work_queues[thread_id].lock.unlock();
+
+        runnable->runTask(task_id, num_total_tasks);
+    }
+}
+
+// Steal work from other threads. And do one task immediately.
+// In case all threads are trying to steal one task
+void TaskSystemParallelThreadPoolSleeping::stealDoWork(int thread_id) {
+    if (unfinished.load(std::memory_order_acquire) == 0) return;
+
+    int victim = rand() % num_threads;
+    for (int _ = 0; _ < num_threads; ++_) { // iterate at most num_threads times
+        // A fast lookup: if victim's work queue is empty, choose next victim
+        if (work_queues[victim].end == work_queues[victim].start) {
+            victim = (victim + 1) % num_threads;
+            continue;
+        }
+
+        // If victim's work queue size >= 1, steal (size + 1) / 2 tasks
+        work_queues[victim].lock.lock();
+        int size = work_queues[victim].end - work_queues[victim].start;
+        if (size == 0) { // In case victim's work queue is stolen before locking
+            work_queues[victim].lock.unlock();
+            victim = (victim + 1) % num_threads;
+            continue;
+        }
+
+        // Steal (size + 1) / 2 tasks. size >= 1, so steal_size >= 1
+        int end = work_queues[victim].end;
+        int start = end - (size + 1) / 2;
+        work_queues[victim].end = start;
+        // Unlock before getting new lock to avoid dead lock
+        work_queues[victim].lock.unlock();
+
+        // Put (steal_size - 1) tasks in work queue
+        work_queues[thread_id].lock.lock();
+        work_queues[thread_id].end = end;
+        work_queues[thread_id].start = start + 1;
+        if (size == 1) { unfinished.fetch_sub(1, std::memory_order_release); }
+        else if (size == 2) {} 
+        else { unfinished.fetch_add(1, std::memory_order_release); }
+        work_queues[thread_id].lock.unlock();
+
+    #if DEBUG_3
+        print_mtx.lock();
+        printf("Thread %d is stealing %d/%d tasks from thread %d\n\tStealer becomes [%d, %d). Victim from [%d, %d) to [%d, %d)\n", 
+        thread_id, (size + 1) / 2, size, victim, 
+        start, end, 
+        end - size, end, 
+        end - size, end - (size + 1) / 2);
+        printf("\tStealer %d is running %d\n", thread_id, start);
+        print_mtx.unlock();
+    #endif
+
+        // Do one work immediately after stealing
+        runnable->runTask(start, num_total_tasks);
+        break;
+    }
+}
+
+void TaskSystemParallelThreadPoolSleeping::sleep() {
+    join_mtx.lock();
+    sleep_cnt.fetch_add(1, std::memory_order_release);
+    main_cv.notify_all(); // Notify main thread
+    join_mtx.unlock();
+#if DEBUG_3
+    printf("Notifying thread starts sleeping\n");
+#endif
+
+    // Sleep
+    std::unique_lock<std::mutex> lock(join_mtx);
+    worker_cv.wait(lock, [this]{
+        return (exit.load(std::memory_order_acquire) 
+            || unfinished.load(std::memory_order_acquire)); }); 
+                                            // Wait for next run
+
+    sleep_cnt.fetch_sub(1, std::memory_order_release);
+    // Sub sleep count before checking exit.
+    // Otherwise, if next run starts, and this thread find exit is false.
+    // But before it subtract sleep_cnt, it's hanged. And other threads 
+    // enter next run and finish all tasks, quickly. exit becomes true.
+    // This thread may still think that exit is false, and start
+    // finishWork and stealDoWork, then sleep, never exit
+}
+
+void TaskSystemParallelThreadPoolSleeping::workerStart(int thread_id) {
+    while (true) {
+        // Sleep if all tasks are done
+        if (unfinished.load(std::memory_order_acquire) == 0)
+            TaskSystemParallelThreadPoolSleeping::sleep();
+        if (exit.load(std::memory_order_acquire) == true) return;
+        // Finish all my works
+        TaskSystemParallelThreadPoolSleeping::finishWork(thread_id);
+        // Steal work from the first unfinished runnable_task
+        TaskSystemParallelThreadPoolSleeping::stealDoWork(thread_id);
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
@@ -465,9 +592,48 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     // tasks sequentially on the calling thread.
     //
 
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+#if DEBUG_3
+    print_mtx.lock();
+    printf("\nNew tasks: %p, total tasks: %d\n", runnable, num_total_tasks);
+    print_mtx.unlock();
+#endif
+
+    // If no workers, create workers and launch tasks
+    if (workers.empty())
+        for (int thread_id = 0; thread_id < num_threads; ++thread_id)
+            workers.emplace_back(
+                &TaskSystemParallelThreadPoolSleeping::workerStart,
+                this, thread_id);
+    
+    int tasks_per_thread = (num_total_tasks + num_threads-1) / num_threads;
+    // Work queue is [task.first, task.second)
+    int active_queue = 0;
+    for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
+        // std::lock_guard<std::mutex> lock(work_queues[thread_id].lock); // Important!!!
+        work_queues[thread_id].start = 
+            std::min(thread_id * tasks_per_thread, num_total_tasks);
+        work_queues[thread_id].end =
+            std::min((thread_id + 1) * tasks_per_thread, num_total_tasks);
+        if (work_queues[thread_id].start != work_queues[thread_id].end) 
+            ++active_queue;
     }
+    this->num_total_tasks = num_total_tasks;
+    this->runnable = runnable;
+    unfinished.store(active_queue);
+    
+    // Tasks prepared, notify all threads to start working
+    worker_cv.notify_all(); // Workers start working
+    
+    // If not finish, block the main 
+    std::unique_lock<std::mutex> lock(join_mtx);
+    main_cv.wait(lock, 
+        [this]{return unfinished.load(std::memory_order_acquire) == 0 &&
+            sleep_cnt.load(std::memory_order_acquire) == num_threads;});
+                // unfinished == 0 is necessary! Otherwise, when it start a new run, 
+                // main thread may exit sleeping while other threads haven't started
+#if DEBUG_3
+    printf("Main thread starts reaping\n");
+#endif
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,

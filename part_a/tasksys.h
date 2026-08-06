@@ -4,7 +4,6 @@
 #include "itasksys.h"
 #include <atomic>
 #include <condition_variable>
-#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -34,8 +33,7 @@ class TaskSystemSerial: public ITaskSystem {
  */
 class TaskSystemParallelSpawn: public ITaskSystem {
     private:
-        std::atomic<int> active;
-        std::atomic<int> finished;
+        std::atomic<int> unfinished{0};
         int num_threads;
         std::vector<std::thread> workers;
         std::vector<std::pair<int, int>> work_queues;
@@ -60,22 +58,21 @@ class TaskSystemParallelSpawn: public ITaskSystem {
 class TaskSystemParallelThreadPoolSpinning: public ITaskSystem { 
     private:
         struct WorkQueue {
-            std::mutex lock; // mutex cannot be moved
+            std::mutex lock; // Mutex cannot be moved
             int start = 0;
             int end = 0;
         };
         
         int num_threads;
         std::vector<std::thread> workers;
-        volatile bool exit; // don't need to be atomic, because only 
-                            // main thread will modify this
+        std::atomic<bool> exit{false}; // Only main thread can modify it
         
-        IRunnable* runnable;
+        IRunnable* runnable = nullptr;
         int num_total_tasks;
-        std::atomic<int> unfinished; // number of unfinished work queues
+        std::atomic<int> unfinished{0}; // Number of unfinished work queues
         std::vector<WorkQueue> work_queues;
 
-        std::atomic<int> join_count; // to simulate join. 
+        std::atomic<int> spin_cnt{0}; // To simulate join. 
                                      // This variable cannot use vector<bool>!!!
     public:
         TaskSystemParallelThreadPoolSpinning(int num_threads);
@@ -99,11 +96,38 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
  * itasksys.h for documentation of the ITaskSystem interface.
  */
 class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
+    private:
+        struct WorkQueue {
+            std::mutex lock; // Mutex cannot be moved
+            int start = 0;
+            int end = 0;
+        };
+        
+        int num_threads;
+        std::vector<std::thread> workers;
+        std::atomic<bool> exit{false}; // Only main thread can modify it
+        
+        IRunnable* runnable = nullptr;
+        int num_total_tasks;
+        std::atomic<int> unfinished{0}; // Number of unfinished work queues
+        std::vector<WorkQueue> work_queues;
+
+        std::condition_variable worker_cv;
+        std::condition_variable main_cv;
+        std::mutex join_mtx;
+        std::atomic<int> sleep_cnt{0};
+
     public:
         TaskSystemParallelThreadPoolSleeping(int num_threads);
         ~TaskSystemParallelThreadPoolSleeping();
         const char* name();
+
+        void workerStart(int thread_id);
+        void finishWork(int thread_id);
+        void stealDoWork(int thread_id);
+        void sleep();
         void run(IRunnable* runnable, int num_total_tasks);
+        
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
