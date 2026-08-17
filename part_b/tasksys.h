@@ -2,6 +2,15 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -60,6 +69,61 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
  * itasksys.h for documentation of the ITaskSystem interface.
  */
 class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
+    private:
+        struct WorkQueue {
+            std::mutex lock; // Mutex cannot be moved
+            int start = 0;
+            int end = 0;
+        };
+        
+        struct Task {
+            IRunnable* runnable;
+            int num_total_tasks;
+            std::atomic<int>* unfinished; // Number of unfinished work queues
+            std::vector<WorkQueue> work_queues;
+            
+            Task(IRunnable* runnable, int num_total_tasks, int active_queue, std::vector<WorkQueue>& work_queues)
+                : runnable(runnable), 
+                  num_total_tasks(num_total_tasks), 
+                  unfinished(new std::atomic<int>(active_queue)), 
+                  work_queues(std::move(work_queues)) {}
+
+            ~Task() {delete(unfinished);}
+        };
+
+        struct PendingTask {
+            IRunnable* runnable;
+            int num_total_tasks;
+            const std::vector<TaskID> deps;
+        };
+        
+        int num_threads;
+        std::vector<std::thread> workers;
+        std::atomic<bool> exit{false};           // Only main thread can modify it
+        
+        TaskID new_task_id;                         // If new task is created, use this id. 
+                                                    // Only main thread can access it
+        std::unordered_map<TaskID, Task*> tasks;    // tasks only store task pointers. 
+                                                    // So that when we add new task to
+                                                    // tasks, other tasks won't be affected
+        std::unordered_map<TaskID, PendingTask> pending_tasks;
+        std::unordered_set<TaskID> finished_tasks;
+        std::atomic<int> unfinished_tasks{0};    // Number of unfinished bunch of tasks
+
+        std::condition_variable worker_cv;          // Worker threads sleep / wakeup
+        std::condition_variable main_cv;            // Main thread sleep / wakeup
+        std::mutex sync_mtx;                        // Mutex that worker_cv and main_cv want to grab
+        std::atomic<int> sleep_cnt{0};
+
+        void workerStart(int thread_id);
+        void finishWork(Task* task, int thread_id);
+        void stealDoWork(Task* task, int thread_id);
+        void workerSleep();
+        void wakeupWorker();
+        void mainSleep();
+        void wakeupMain();
+        void addTask(const TaskID task_id, IRunnable* runnable, int num_total_tasks);
+
     public:
         TaskSystemParallelThreadPoolSleeping(int num_threads);
         ~TaskSystemParallelThreadPoolSleeping();

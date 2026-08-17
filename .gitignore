@@ -1,3 +1,7 @@
 .vscode
 part_a/compile_commands.json
 part_a/log.txt
+tutorial/output/tutorial.dSYM/Contents/Info.plist
+tutorial/output/tutorial.dSYM/Contents/Resources/Relocations/aarch64/tutorial.yml
+tutorial/output/tutorial.dSYM/Contents/Resources/DWARF/tutorial
+tutorial/output/tutorial

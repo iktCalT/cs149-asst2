@@ -355,3 +355,338 @@ Overall performance results
 [Parallel + Thread Pool + Spin]         : Perf did not pass all tests
 [Parallel + Thread Pool + Sleep]        : All passed Perf
 ```
+
+## Part B
+
+There is a bug that I spent hours to find: 
+
+```c++
+void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id) {
+    if (task->unfinished->load(std::memory_order_acquire) == 0) return;
+
+    int victim = (thread_id + 1) % num_threads;
+    for (int _ = 0; _ < num_threads; ++_) { // iterate at most num_threads times
+        // A fast lookup: if victim's work queue is empty, choose next victim
+        if (task->work_queues[victim].end == task->work_queues[victim].start) {
+            victim = (victim + 1) % num_threads;
+            continue;
+        }
+
+        // If victim's work queue size >= 1, steal (size + 1) / 2 tasks
+        task->work_queues[victim].lock.lock();
+        int size = task->work_queues[victim].end - task->work_queues[victim].start;
+        if (size == 0) { // In case victim's work queue is stolen before locking
+            task->work_queues[victim].lock.unlock();
+            victim = (victim + 1) % num_threads;
+            continue;
+        }
+
+        // Steal (size + 1) / 2 tasks. size >= 1, so steal_size >= 1
+        int end = task->work_queues[victim].end;
+        int start = end - (size + 1) / 2;
+        task->work_queues[victim].end = start;
+        
+        // Unlock before getting new lock to avoid dead lock
+        task->work_queues[victim].lock.unlock();
+
+        // Put (steal_size - 1) tasks in work queue
+        task->work_queues[thread_id].lock.lock();
+        task->work_queues[thread_id].end = end;
+        task->work_queues[thread_id].start = start + 1;
+        task->work_queues[thread_id].lock.unlock();
+
+        if (size == 1) { 
+            if (task->unfinished->fetch_sub(1, std::memory_order_release) == 1)
+                unfinished_tasks.fetch_sub(1, std::memory_order_release);
+        }
+        else if (size == 2) {} 
+        else { task->unfinished->fetch_add(1, std::memory_order_release); }
+        // Do one work immediately after stealing
+        task->runnable->runTask(start, task->num_total_tasks);
+        break;
+    }
+}
+```
+
+This is incorrect! Because we renew `task->unfinished` after unlock, `task->unfinished` may be less than real value can be subtracted to 0 multiple times. And every time it becomes 0, `unfinished_tasks` will subtract 1. So, even when all tasks are done, some workers may find that `unfinished_tasks < 0`, and won't go sleep. Here is how I solve it:  
+
+1. Move it into lock
+2. Make sure if we subtract `unfinished_tasks` unexpectedly, add it back.
+
+```c++
+void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id) {
+    if (task->unfinished->load(std::memory_order_acquire) == 0) return;
+
+    int victim = (thread_id + 1) % num_threads;
+    for (int _ = 0; _ < num_threads; ++_) { // iterate at most num_threads times
+        // A fast lookup: if victim's work queue is empty, choose next victim
+        if (task->work_queues[victim].end == task->work_queues[victim].start) {
+            victim = (victim + 1) % num_threads;
+            continue;
+        }
+
+        // If victim's work queue size >= 1, steal (size + 1) / 2 tasks
+        task->work_queues[victim].lock.lock();
+        int size = task->work_queues[victim].end - task->work_queues[victim].start;
+        if (size == 0) { // In case victim's work queue is stolen before locking
+            task->work_queues[victim].lock.unlock();
+            victim = (victim + 1) % num_threads;
+            continue;
+        }
+
+        // Steal (size + 1) / 2 tasks. size >= 1, so steal_size >= 1
+        int end = task->work_queues[victim].end;
+        int start = end - (size + 1) / 2;
+        task->work_queues[victim].end = start;
+        if (size == 1) { 
+            if (task->unfinished->fetch_sub(1, std::memory_order_release) == 1)
+                unfinished_tasks.fetch_sub(1, std::memory_order_release);
+        }
+        else if (size > 2) { 
+            if (task->unfinished->fetch_add(1, std::memory_order_release) == 0)
+                unfinished_tasks.fetch_add(1, std::memory_order_release);
+        }
+        // Unlock before getting new lock to avoid dead lock
+        task->work_queues[victim].lock.unlock();
+
+        // Put (steal_size - 1) tasks in work queue
+        task->work_queues[thread_id].lock.lock();
+        task->work_queues[thread_id].end = end;
+        task->work_queues[thread_id].start = start + 1;
+        task->work_queues[thread_id].lock.unlock();
+
+    #if DEBUG_3
+        printf("Thread %d is stealing %d/%d tasks from thread %d\n\tStealer becomes [%d, %d). Victim from [%d, %d) to [%d, %d)\n", 
+        thread_id, (size + 1) / 2, size, victim, 
+        start, end, 
+        end - size, end, 
+        end - size, end - (size + 1) / 2);
+    #endif
+    #if DEBUG_4
+        printf("\tTask %p: stealer %d is running %d\n", task->runnable, thread_id, start);
+    #endif
+
+        // Do one work immediately after stealing
+        task->runnable->runTask(start, task->num_total_tasks);
+        break;
+    }
+}
+```
+
+### Result
+
+```zsh
+# MacOS + M5
+python3 ../tests/run_test_harness.py -n 10 -a
+runtasks_ref
+Darwin arm64
+================================================================================
+Running task system grading harness... (22 total tests)
+  - Detected CPU with 10 execution contexts
+  - Task system configured to use at most 10 threads
+================================================================================
+================================================================================
+Executing test: super_super_light...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: super_super_light
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                3.388     3.337       1.02  (OK)
+[Parallel + Always Spawn]               3.357     25.208      0.13  (OK)
+[Parallel + Thread Pool + Spin]         3.331     33.246      0.10  (OK)
+[Parallel + Thread Pool + Sleep]        11.451    13.351      0.86  (OK)
+================================================================================
+Executing test: super_super_light_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: super_super_light_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                3.473     3.427       1.01  (OK)
+[Parallel + Always Spawn]               3.455     25.758      0.13  (OK)
+[Parallel + Thread Pool + Spin]         3.479     25.812      0.13  (OK)
+[Parallel + Thread Pool + Sleep]        11.103    14.139      0.79  (OK)
+================================================================================
+Executing test: super_light...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: super_light
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                13.631    21.63       0.63  (OK)
+[Parallel + Always Spawn]               13.592    33.521      0.41  (OK)
+[Parallel + Thread Pool + Spin]         13.532    42.282      0.32  (OK)
+[Parallel + Thread Pool + Sleep]        16.403    18.307      0.90  (OK)
+================================================================================
+Executing test: super_light_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: super_light_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                13.651    21.45       0.64  (OK)
+[Parallel + Always Spawn]               13.646    34.674      0.39  (OK)
+[Parallel + Thread Pool + Spin]         13.635    33.013      0.41  (OK)
+[Parallel + Thread Pool + Sleep]        17.223    17.163      1.00  (OK)
+================================================================================
+Executing test: ping_pong_equal...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: ping_pong_equal
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                218.963   392.056     0.56  (OK)
+[Parallel + Always Spawn]               219.106   87.143      2.51  (NOT OK)
+[Parallel + Thread Pool + Spin]         219.296   83.022      2.64  (NOT OK)
+[Parallel + Thread Pool + Sleep]        56.371    73.026      0.77  (OK)
+================================================================================
+Executing test: ping_pong_equal_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: ping_pong_equal_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                219.019   395.934     0.55  (OK)
+[Parallel + Always Spawn]               219.012   88.322      2.48  (NOT OK)
+[Parallel + Thread Pool + Spin]         219.078   74.875      2.93  (NOT OK)
+[Parallel + Thread Pool + Sleep]        57.799    72.761      0.79  (OK)
+================================================================================
+Executing test: ping_pong_unequal...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: ping_pong_unequal
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                399.284   470.448     0.85  (OK)
+[Parallel + Always Spawn]               395.385   113.854     3.47  (NOT OK)
+[Parallel + Thread Pool + Spin]         395.109   113.909     3.47  (NOT OK)
+[Parallel + Thread Pool + Sleep]        88.765    101.102     0.88  (OK)
+================================================================================
+Executing test: ping_pong_unequal_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: ping_pong_unequal_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                393.734   467.043     0.84  (OK)
+[Parallel + Always Spawn]               394.383   114.342     3.45  (NOT OK)
+[Parallel + Thread Pool + Spin]         394.824   103.234     3.82  (NOT OK)
+[Parallel + Thread Pool + Sleep]        89.012    99.943      0.89  (OK)
+================================================================================
+Executing test: recursive_fibonacci...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: recursive_fibonacci
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                825.15    824.681     1.00  (OK)
+[Parallel + Always Spawn]               825.225   126.613     6.52  (NOT OK)
+[Parallel + Thread Pool + Spin]         824.762   131.304     6.28  (NOT OK)
+[Parallel + Thread Pool + Sleep]        124.819   129.02      0.97  (OK)
+================================================================================
+Executing test: recursive_fibonacci_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: recursive_fibonacci_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                825.317   825.259     1.00  (OK)
+[Parallel + Always Spawn]               825.036   126.055     6.55  (NOT OK)
+[Parallel + Thread Pool + Spin]         824.92    127.567     6.47  (NOT OK)
+[Parallel + Thread Pool + Sleep]        123.253   126.986     0.97  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                184.731   184.492     1.00  (OK)
+[Parallel + Always Spawn]               183.003   149.138     1.23  (OK)
+[Parallel + Thread Pool + Spin]         182.919   161.656     1.13  (OK)
+[Parallel + Thread Pool + Sleep]        92.797    97.186      0.95  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                185.674   184.532     1.01  (OK)
+[Parallel + Always Spawn]               183.181   151.512     1.21  (OK)
+[Parallel + Thread Pool + Spin]         183.227   115.112     1.59  (NOT OK)
+[Parallel + Thread Pool + Sleep]        98.463    85.782      1.15  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_fewer_tasks...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop_fewer_tasks
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                185.252   185.424     1.00  (OK)
+[Parallel + Always Spawn]               182.946   149.444     1.22  (OK)
+[Parallel + Thread Pool + Spin]         182.935   158.723     1.15  (OK)
+[Parallel + Thread Pool + Sleep]        97.015    96.236      1.01  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_fewer_tasks_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop_fewer_tasks_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                193.686   185.309     1.05  (OK)
+[Parallel + Always Spawn]               182.897   150.143     1.22  (OK)
+[Parallel + Thread Pool + Spin]         182.839   34.446      5.31  (NOT OK)
+[Parallel + Thread Pool + Sleep]        32.643    34.36       0.95  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_fan_in...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop_fan_in
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                103.513   103.452     1.00  (OK)
+[Parallel + Always Spawn]               94.41     35.604      2.65  (NOT OK)
+[Parallel + Thread Pool + Spin]         94.288    36.407      2.59  (NOT OK)
+[Parallel + Thread Pool + Sleep]        26.615    30.649      0.87  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_fan_in_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop_fan_in_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                102.404   102.848     1.00  (OK)
+[Parallel + Always Spawn]               94.285    35.989      2.62  (NOT OK)
+[Parallel + Thread Pool + Spin]         94.215    19.972      4.72  (NOT OK)
+[Parallel + Thread Pool + Sleep]        17.391    18.658      0.93  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_reduction_tree...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop_reduction_tree
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                101.602   102.564     0.99  (OK)
+[Parallel + Always Spawn]               93.911    21.898      4.29  (NOT OK)
+[Parallel + Thread Pool + Spin]         93.772    21.866      4.29  (NOT OK)
+[Parallel + Thread Pool + Sleep]        19.043    18.86       1.01  (OK)
+================================================================================
+Executing test: math_operations_in_tight_for_loop_reduction_tree_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: math_operations_in_tight_for_loop_reduction_tree_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                102.043   102.65      0.99  (OK)
+[Parallel + Always Spawn]               93.876    21.343      4.40  (NOT OK)
+[Parallel + Thread Pool + Spin]         93.808    16.687      5.62  (NOT OK)
+[Parallel + Thread Pool + Sleep]        16.674    16.556      1.01  (OK)
+================================================================================
+Executing test: spin_between_run_calls...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: spin_between_run_calls
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                292.8     292.716     1.00  (OK)
+[Parallel + Always Spawn]               293.016   148.707     1.97  (NOT OK)
+[Parallel + Thread Pool + Spin]         293.208   163.695     1.79  (NOT OK)
+[Parallel + Thread Pool + Sleep]        148.562   148.542     1.00  (OK)
+================================================================================
+Executing test: spin_between_run_calls_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: spin_between_run_calls_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                292.837   292.936     1.00  (OK)
+[Parallel + Always Spawn]               293.036   148.624     1.97  (NOT OK)
+[Parallel + Thread Pool + Spin]         292.964   161.833     1.81  (NOT OK)
+[Parallel + Thread Pool + Sleep]        148.466   148.461     1.00  (OK)
+================================================================================
+Executing test: mandelbrot_chunked...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: mandelbrot_chunked
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                227.999   230.863     0.99  (OK)
+[Parallel + Always Spawn]               227.266   32.592      6.97  (NOT OK)
+[Parallel + Thread Pool + Spin]         226.199   33.677      6.72  (NOT OK)
+[Parallel + Thread Pool + Sleep]        32.085    32.481      0.99  (OK)
+================================================================================
+Executing test: mandelbrot_chunked_async...
+Reference binary: ./runtasks_ref_osx_arm
+Results for: mandelbrot_chunked_async
+                                        STUDENT   REFERENCE   PERF?
+[Serial]                                227.494   229.153     0.99  (OK)
+[Parallel + Always Spawn]               226.68    32.496      6.98  (NOT OK)
+[Parallel + Thread Pool + Spin]         226.24    33.158      6.82  (NOT OK)
+[Parallel + Thread Pool + Sleep]        32.088    32.614      0.98  (OK)
+================================================================================
+Overall performance results
+[Serial]                                : All passed Perf
+[Parallel + Always Spawn]               : Perf did not pass all tests
+[Parallel + Thread Pool + Spin]         : Perf did not pass all tests
+[Parallel + Thread Pool + Sleep]        : All passed Perf
+```
