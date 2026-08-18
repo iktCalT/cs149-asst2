@@ -4,6 +4,7 @@
 #include "itasksys.h"
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
@@ -113,7 +114,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         std::condition_variable worker_cv;          // Worker threads sleep / wakeup
         std::condition_variable main_cv;            // Main thread sleep / wakeup
         std::mutex sync_mtx;                        // Mutex that worker_cv and main_cv want to grab
-        std::atomic<int> sleep_cnt{0};
+        int sleep_cnt = 0;
 
         void workerStart(int thread_id);
         void finishWork(Task* task, int thread_id);
@@ -121,6 +122,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         void workerSleep();
         void wakeupWorker();
         void mainSleep();
+        inline void mainSleep(std::unique_lock<std::mutex>& lock);
         void wakeupMain();
         void addTask(const TaskID task_id, IRunnable* runnable, int num_total_tasks);
 

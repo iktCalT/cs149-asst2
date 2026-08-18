@@ -1,6 +1,7 @@
 #include "tasksys.h"
 #include "itasksys.h"
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -165,19 +166,19 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
 
     exit.store(true, std::memory_order_release);
     wakeupWorker();
+#if DEBUG_4
+    printf("Joining workers...\n");
+#endif
     for (int thread_id = 0; thread_id < num_threads; ++thread_id)
         if (workers[thread_id].joinable())
             workers[thread_id].join();
 }
 
 void TaskSystemParallelThreadPoolSleeping::finishWork(Task* task, int thread_id) {
-    // Finish my work
-    if (task->unfinished->load(std::memory_order_acquire) == 0
-        || task->work_queues[thread_id].start == task->work_queues[thread_id].end) return;
-
     while (true) {
         task->work_queues[thread_id].lock.lock();
-        if (task->work_queues[thread_id].start == task->work_queues[thread_id].end) {
+        if (task->unfinished->load(std::memory_order_acquire) == 0 
+            || task->work_queues[thread_id].start == task->work_queues[thread_id].end) {
             // Incase work is stolen before locking
             task->work_queues[thread_id].lock.unlock();
             break;
@@ -187,7 +188,7 @@ void TaskSystemParallelThreadPoolSleeping::finishWork(Task* task, int thread_id)
         if (task->work_queues[thread_id].start == task->work_queues[thread_id].end)
             if (task->unfinished->fetch_sub(1, std::memory_order_release) == 1)
                 unfinished_tasks.fetch_sub(1, std::memory_order_release);
-    #if DEBUG_4
+    #if DEBUG_1
         printf("Task %p: thread %d is running %p, sub_task_id: %d, num_total_tasks: %d\n", 
             task->runnable, thread_id, task->runnable, sub_task_id, task->num_total_tasks);
     #endif
@@ -248,7 +249,7 @@ void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id
         end - size, end, 
         end - size, end - (size + 1) / 2);
     #endif
-    #if DEBUG_4
+    #if DEBUG_1
         printf("\tTask %p: stealer %d is running %d\n", task->runnable, thread_id, start);
     #endif
 
@@ -289,29 +290,35 @@ void TaskSystemParallelThreadPoolSleeping::workerSleep() {
 #if DEBUG_4
     printf("Worker sleep\n");
 #endif
+    std::unique_lock<std::mutex> lock(sync_mtx);
 
-    if (sleep_cnt.fetch_add(1, std::memory_order_release) == num_threads - 1)
+    if (exit.load(std::memory_order_acquire)) return;
+
+    ++sleep_cnt;
+    if (sleep_cnt == num_threads)
         wakeupMain();
 
     // Sleep
-    std::unique_lock<std::mutex> lock(sync_mtx);
     worker_cv.wait(lock, [this]{
         return exit.load(std::memory_order_acquire) == true 
             || unfinished_tasks.load(std::memory_order_acquire) != 0; }); 
 
-    sleep_cnt.fetch_sub(1, std::memory_order_release); // Awaken, subtract sleep_cnt
+    --sleep_cnt; // Awaken, subtract sleep_cnt
     // Sub sleep count before checking exit.
     // Otherwise, if next run starts, and this thread find exit is false.
     // But before it subtract sleep_cnt, it's hanged. And other threads 
     // enter next run and finish all tasks, quickly. exit becomes true.
     // This thread may still think that exit is false, and start
     // finishWork and stealDoWork, then sleep, never exit
+#if DEBUG_4
+    printf("Worker waken up\n");
+#endif
 }
 
 // Wakeup workers -> can only be called by main thread
 void TaskSystemParallelThreadPoolSleeping::wakeupWorker() {
 #if DEBUG_4
-    printf("Worker wakeup\n");
+    printf("Try to wakeup workers\n");
 #endif
     // When tasks are prepared, notify all sleeping threads to start working
     worker_cv.notify_all(); // Workers start working
@@ -381,21 +388,35 @@ void TaskSystemParallelThreadPoolSleeping::addTask(
 
 void TaskSystemParallelThreadPoolSleeping::mainSleep() {
     // If not finish, block the main
+    std::unique_lock<std::mutex> lock(sync_mtx);
+    mainSleep(lock);
+}
+
+inline void TaskSystemParallelThreadPoolSleeping::mainSleep(std::unique_lock<std::mutex>& lock) {
+    // If not finish, block the main
 #if DEBUG_4
     printf("Main sleep\n");
 #endif
-    std::unique_lock<std::mutex> lock(sync_mtx);
     main_cv.wait(lock, 
-        [this]{return unfinished_tasks.load(std::memory_order_acquire) == 0 &&
-            sleep_cnt.load(std::memory_order_acquire) == num_threads;});
+        [this]{
+        #if DEBUG_4
+            printf("Unfinished tasks: %d, non-sleeping workers: %d\n", 
+                unfinished_tasks.load(std::memory_order_relaxed), 
+                num_threads - sleep_cnt);
+        #endif
+            return unfinished_tasks.load(std::memory_order_acquire) == 0 &&
+                                            sleep_cnt == num_threads;});
                 // When all tasks are done and all threads are sleeping, wake up
+#if DEBUG_4
+    printf("Main waken up\n");
+#endif
 }
 
 void TaskSystemParallelThreadPoolSleeping::wakeupMain() {
 #if DEBUG_4
-    printf("Main wakeup\n");
+    printf("Try to wakeup main\n");
 #endif
-    main_cv.notify_all(); // Notify main thread that all threads are sleeping
+    main_cv.notify_one(); // Notify main thread that all threads are sleeping
 }
 
 // Sync, must be called when all threads are sleeping
@@ -411,12 +432,15 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
     mainSleep(); // Make sure to run sync() when all worker threads are sleeping
 
     while (!pending_tasks.empty()) {
+        // Hold the lock, incase some workers are waken up 
+        // due to stealDoWork's unfinished_tasks.fetch_add(1)
+        std::unique_lock<std::mutex> lock(sync_mtx);
+        mainSleep(lock);
+
         // All work in task is done, add new works to tasks
         for (const auto& task : tasks) {
             finished_tasks.emplace(task.first);
-            delete(task.second);
         }
-
         tasks.clear(); // Clear tasks list
 
         for (auto it = pending_tasks.begin(); it != pending_tasks.end();) {
@@ -437,7 +461,9 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
         }
 
         unfinished_tasks.store(tasks.size(), std::memory_order_release);
+        lock.unlock();
+
         wakeupWorker(); // Tell workers that you have new work to do
-        mainSleep();    // Sleep until all tasks are done
     }
+    mainSleep();        // Sleep until all tasks are done
 }

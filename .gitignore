@@ -5,3 +5,5 @@ tutorial/output/tutorial.dSYM/Contents/Info.plist
 tutorial/output/tutorial.dSYM/Contents/Resources/Relocations/aarch64/tutorial.yml
 tutorial/output/tutorial.dSYM/Contents/Resources/DWARF/tutorial
 tutorial/output/tutorial
+part_b/runtasks.dSYM/Contents/Info.plist
+part_b/runtasks.dSYM/Contents/Resources/Relocations/aarch64/runtasks.yml
