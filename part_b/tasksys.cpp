@@ -269,19 +269,13 @@ void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id
 }
 
 void TaskSystemParallelThreadPoolSleeping::workerStart(int thread_id) {
-    printf("Worker %d: loop begin\n", thread_id);
     while (true) {
         // Sleep if all tasks are done
         #if DEBUG_1
             printf("unfinished_tasks: %d\n", unfinished_tasks.load(std::memory_order_acquire));
         #endif
-        if (unfinished_tasks.load(std::memory_order_acquire) == 0) {
-            printf("Worker %d: before sleep\n", thread_id);   
+        if (unfinished_tasks.load(std::memory_order_acquire) == 0)
             workerSleep();
-            printf("Worker %d: after sleep, exit=%d\n",
-                   thread_id,
-                   exit.load(std::memory_order_acquire));
-        }
 
         if (exit.load(std::memory_order_acquire)) {
         #if DEBUG_4
@@ -289,26 +283,18 @@ void TaskSystemParallelThreadPoolSleeping::workerStart(int thread_id) {
         #endif
             return;
         }
-        printf("Worker %d: before finishWork\n", thread_id);
 
         // Finish all my work (from different tasks)
         for (auto[task_id, task] : tasks) {
         #if DEBUG_1
             printf("Calling finishWork(%p, %d)\n", task, thread_id);
         #endif
-            printf("Worker %d: finishWork task %d\n",
-                   thread_id, task_id);
             finishWork(task, thread_id);
         }
-        printf("Worker %d: before steal\n", thread_id);
 
         // Steal work from the first unfinished runnable_task, and finish it
         for (auto[task_id, task] : tasks) {
-            printf("Worker %d: stealDoWork task %d\n",
-                   thread_id, task_id);
             stealDoWork(task, thread_id);
-            printf("Worker %d: finish stolen work task %d\n",
-                   thread_id, task_id);
             finishWork(task, thread_id);
         }
     }
