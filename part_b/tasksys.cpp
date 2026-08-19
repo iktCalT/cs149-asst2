@@ -164,14 +164,23 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     // (requiring changes to tasksys.h).
     //
 
-    exit.store(true, std::memory_order_release);
-    wakeupWorker();
-#if DEBUG_4
-    printf("Joining workers...\n");
-#endif
+    {
+        std::lock_guard<std::mutex> lock(sync_mtx);
+
+        exit.store(true, std::memory_order_release);
+        wakeupWorker();
+    }
+
     for (int thread_id = 0; thread_id < num_threads; ++thread_id)
-        if (workers[thread_id].joinable())
+        if (workers[thread_id].joinable()) {
+            #if DEBUG_4
+                printf("Joining worker %d...\n", thread_id);
+            #endif
             workers[thread_id].join();
+            #if DEBUG_4
+                printf("Joined worker %d...\n", thread_id);
+            #endif
+        }
 }
 
 void TaskSystemParallelThreadPoolSleeping::finishWork(Task* task, int thread_id) {
@@ -207,10 +216,10 @@ void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id
     int victim = (thread_id + 1) % num_threads;
     for (int _ = 0; _ < num_threads; ++_) { // iterate at most num_threads times
         // A fast lookup: if victim's work queue is empty, choose next victim
-        if (task->work_queues[victim].end == task->work_queues[victim].start) {
-            victim = (victim + 1) % num_threads;
-            continue;
-        }
+        // if (task->work_queues[victim].end == task->work_queues[victim].start) {
+        //     victim = (victim + 1) % num_threads;
+        //     continue;
+        // }
 
         // If victim's work queue size >= 1, steal (size + 1) / 2 tasks
         task->work_queues[victim].lock.lock();
@@ -260,26 +269,46 @@ void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id
 }
 
 void TaskSystemParallelThreadPoolSleeping::workerStart(int thread_id) {
+    printf("Worker %d: loop begin\n", thread_id);
     while (true) {
         // Sleep if all tasks are done
         #if DEBUG_1
             printf("unfinished_tasks: %d\n", unfinished_tasks.load(std::memory_order_acquire));
         #endif
-        if (unfinished_tasks.load(std::memory_order_acquire) == 0)
+        if (unfinished_tasks.load(std::memory_order_acquire) == 0) {
+            printf("Worker %d: before sleep\n", thread_id);   
             workerSleep();
-        if (exit.load(std::memory_order_acquire) == true) return;
+            printf("Worker %d: after sleep, exit=%d\n",
+                   thread_id,
+                   exit.load(std::memory_order_acquire));
+        }
+
+        if (exit.load(std::memory_order_acquire)) {
+        #if DEBUG_4
+            printf("Worker %d exiting\n", thread_id);
+        #endif
+            return;
+        }
+        printf("Worker %d: before finishWork\n", thread_id);
 
         // Finish all my work (from different tasks)
         for (auto[task_id, task] : tasks) {
         #if DEBUG_1
             printf("Calling finishWork(%p, %d)\n", task, thread_id);
         #endif
+            printf("Worker %d: finishWork task %d\n",
+                   thread_id, task_id);
             finishWork(task, thread_id);
         }
+        printf("Worker %d: before steal\n", thread_id);
 
         // Steal work from the first unfinished runnable_task, and finish it
         for (auto[task_id, task] : tasks) {
+            printf("Worker %d: stealDoWork task %d\n",
+                   thread_id, task_id);
             stealDoWork(task, thread_id);
+            printf("Worker %d: finish stolen work task %d\n",
+                   thread_id, task_id);
             finishWork(task, thread_id);
         }
     }
