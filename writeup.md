@@ -474,3 +474,11 @@ void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id
 ```
 
 Here are the [test results](./part_b/testresults.md)
+
+## Part B optimization
+
+I will use topological sorting to make task assignment faster.
+
+It should be feasible because we know that there is no cycle in task dependencies. Moreover, in my implementation, all task are already added to `pending_task` before calling `sync()`, there is no new task is added during `sync()` process.
+
+Renew: I implemented topological sorting version.

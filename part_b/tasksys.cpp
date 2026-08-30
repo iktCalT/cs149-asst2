@@ -7,12 +7,15 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #define DEBUG_1 0
 #define DEBUG_2 0
 #define DEBUG_3 0
 #define DEBUG_4 0
+#define DEBUG_5 0
 
 IRunnable::~IRunnable() {}
 
@@ -365,7 +368,7 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
 
     TaskID task_id = new_task_id++;
     // C++ 11 doesn't support try_emplace
-    pending_tasks.emplace(task_id, PendingTask{runnable, num_total_tasks, deps});
+    pending_tasks.emplace(task_id, PendingTask(runnable, num_total_tasks, deps));
 #if DEBUG_2
     printf("runWithAsync() called. Runnable: %p, num_total_tasks: %d, deps: ", runnable, num_total_tasks);
     for (TaskID task_id : deps)
@@ -376,13 +379,12 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
 }
 
 // When all workers are sleeping and waiting for work, this function is called
-void TaskSystemParallelThreadPoolSleeping::addTask(
-    TaskID task_id, IRunnable* runnable, int num_total_tasks) {
+void TaskSystemParallelThreadPoolSleeping::addTask(TaskID pending_id, PendingTask& pending_task) {
     
 #if DEBUG_4
-    printf("addTask() called. task_id: %d, runnable: %p, num_total_tasks: %d\n", task_id, runnable, num_total_tasks);
+    printf("addTask() called. task_id: %d, runnable: %p, num_total_tasks: %d\n", pending_id, pending_task.runnable, pending_task.num_total_tasks);
 #endif
-    int tasks_per_thread = (num_total_tasks + num_threads-1) / num_threads;
+    int tasks_per_thread = (pending_task.num_total_tasks + num_threads-1) / num_threads;
     // Work queue is [task.first, task.second)
     int active_queue = 0;
     std::vector<WorkQueue> work_queues(num_threads);
@@ -390,15 +392,15 @@ void TaskSystemParallelThreadPoolSleeping::addTask(
         // std::lock_guard<std::mutex> lock(tasks[task_id]->work_queues[thread_id].lock); 
                 // Not necessary, because this function must be run when all workers are sleeping
         work_queues[thread_id].start = 
-            std::min(thread_id * tasks_per_thread, num_total_tasks);
+            std::min(thread_id * tasks_per_thread, pending_task.num_total_tasks);
         work_queues[thread_id].end =
-            std::min((thread_id + 1) * tasks_per_thread, num_total_tasks);
+            std::min((thread_id + 1) * tasks_per_thread, pending_task.num_total_tasks);
         if (work_queues[thread_id].start != work_queues[thread_id].end) 
             ++active_queue;
     }
 
-    this->tasks.emplace(task_id,
-        new Task(runnable, num_total_tasks, active_queue, work_queues)); // remember to delete it
+    this->tasks.emplace(pending_id,
+        new Task(pending_task.runnable, pending_task.num_total_tasks, pending_task.downstream, active_queue, work_queues)); // remember to delete it
 }
 
 void TaskSystemParallelThreadPoolSleeping::mainSleep() {
@@ -434,6 +436,84 @@ void TaskSystemParallelThreadPoolSleeping::wakeupMain() {
     main_cv.notify_one(); // Notify main thread that all threads are sleeping
 }
 
+// According to `deps`, build `dep_by`
+// We can write a parallel version of this function.
+// But it will make things really complex due to race condition
+void TaskSystemParallelThreadPoolSleeping::buildDependents() {
+    for (const auto& pending_task : pending_tasks) {
+        const TaskID down_id = pending_task.first;
+        const PendingTask& down = pending_task.second;
+        
+        for (const TaskID up_id : down.upstream) {
+            auto it = pending_tasks.find(up_id);
+            if (it != pending_tasks.end()) {
+                it->second.downstream.insert(down_id);
+            }
+        }
+    }
+
+#if DEBUG_5
+    printf("All deps: \n");
+    for (auto task : pending_tasks) {
+        printf("Task id: %d\n\tUpstream: ", task.first);
+        for (auto up : task.second.upstream) {
+            printf("%d, ", up);
+        }
+        printf("\n\tDownstream: ");
+        for (auto down : task.second.downstream) {
+            printf("%d, ", down);
+        }
+        printf("\n");
+    }
+#endif
+}
+
+void TaskSystemParallelThreadPoolSleeping::activateInitTasks() {
+    for (auto it = pending_tasks.begin(); it != pending_tasks.end();) {
+        if (it->second.upstream.empty()) {
+            addTask(it->first, it->second);
+            it = pending_tasks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    unfinished_tasks.store(tasks.size(), std::memory_order_release);
+
+#if DEBUG_5
+    printf("Handling tasks: ");
+    for (auto task : tasks) printf("%d, ", task.first);
+    printf("\n");
+#endif
+}
+
+// Move tasks ready to perform from pending tasks set to working tasks set
+void TaskSystemParallelThreadPoolSleeping::activateReadyTasks() {
+    // All work in task is done, add new works to tasks
+    std::unordered_map<TaskID, Task*> finished_tasks = std::move(tasks);
+    tasks = std::unordered_map<TaskID, Task*>();
+
+    for (const auto& task : finished_tasks) {
+        const TaskID up_id = task.first;
+        const Task* up = task.second;
+
+        for (TaskID down_id : up->downstream) {
+            auto it = pending_tasks.find(down_id);
+            if (it != pending_tasks.end()) {
+                PendingTask& down = it->second;
+                down.upstream.erase(up_id);
+                if (down.upstream.empty()) {
+                    addTask(down_id, down);
+                    pending_tasks.erase(it);
+                }
+            }
+        }
+    }
+    
+    for (auto task : finished_tasks)
+        delete task.second; // Avoid memory leak
+    unfinished_tasks.store(tasks.size(), std::memory_order_release);
+}
+
 // Sync, must be called when all threads are sleeping
 void TaskSystemParallelThreadPoolSleeping::sync() {
 
@@ -445,37 +525,18 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
     printf("sync() called\n");
 #endif
     mainSleep(); // Make sure to run sync() when all worker threads are sleeping
+    buildDependents();
 
     while (!pending_tasks.empty()) {
         // Hold the lock, incase some workers are waken up 
         // due to stealDoWork's unfinished_tasks.fetch_add(1)
         std::unique_lock<std::mutex> lock(sync_mtx);
         mainSleep(lock);
+        if (tasks.empty()) 
+            activateInitTasks();
+        else 
+            activateReadyTasks();
 
-        // All work in task is done, add new works to tasks
-        for (const auto& task : tasks) {
-            finished_tasks.emplace(task.first);
-        }
-        tasks.clear(); // Clear tasks list
-
-        for (auto it = pending_tasks.begin(); it != pending_tasks.end();) {
-            bool can_add = true;
-            for (TaskID dep : it->second.deps) {
-                if (finished_tasks.find(dep) == finished_tasks.end()) { // C++11 doesn't support contains()
-                    can_add = false;
-                    break;
-                }
-            }
-
-            if (can_add) {
-                addTask(it->first, it->second.runnable, it->second.num_total_tasks);
-                it = pending_tasks.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        unfinished_tasks.store(tasks.size(), std::memory_order_release);
         lock.unlock();
 
         wakeupWorker(); // Tell workers that you have new work to do
