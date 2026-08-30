@@ -11,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 /*
@@ -80,12 +81,14 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         struct Task {
             IRunnable* runnable;
             int num_total_tasks;
+            const std::unordered_set<TaskID> downstream;
             std::atomic<int>* unfinished; // Number of unfinished work queues
             std::vector<WorkQueue> work_queues;
             
-            Task(IRunnable* runnable, int num_total_tasks, int active_queue, std::vector<WorkQueue>& work_queues)
+            Task(IRunnable* runnable, int num_total_tasks, std::unordered_set<TaskID>& downstream, int active_queue, std::vector<WorkQueue>& work_queues)
                 : runnable(runnable), 
-                  num_total_tasks(num_total_tasks), 
+                  num_total_tasks(num_total_tasks),
+                  downstream(std::move(downstream)), 
                   unfinished(new std::atomic<int>(active_queue)), 
                   work_queues(std::move(work_queues)) {}
 
@@ -95,7 +98,11 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         struct PendingTask {
             IRunnable* runnable;
             int num_total_tasks;
-            const std::vector<TaskID> deps;
+            std::unordered_set<TaskID> upstream;
+            std::unordered_set<TaskID> downstream;
+
+            PendingTask(IRunnable* runnable, int num_total_tasks, const std::vector<int>& upstream) 
+                : runnable(runnable), num_total_tasks(num_total_tasks), upstream(upstream.begin(), upstream.end()), downstream({}) {}
         };
         
         int num_threads;
@@ -108,7 +115,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
                                                     // So that when we add new task to
                                                     // tasks, other tasks won't be affected
         std::unordered_map<TaskID, PendingTask> pending_tasks;
-        std::unordered_set<TaskID> finished_tasks;
+        // std::unordered_set<TaskID> finished_tasks;
         std::atomic<int> unfinished_tasks{0};    // Number of unfinished bunch of tasks
 
         std::condition_variable worker_cv;          // Worker threads sleep / wakeup
@@ -124,7 +131,9 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         void mainSleep();
         inline void mainSleep(std::unique_lock<std::mutex>& lock);
         void wakeupMain();
-        void addTask(const TaskID task_id, IRunnable* runnable, int num_total_tasks);
+        void addTask(const TaskID task_id, PendingTask& pending_task);
+        void buildDependents();
+        void activateInitTasks();
         void activateReadyTasks();
 
     public:
