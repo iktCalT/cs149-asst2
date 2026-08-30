@@ -125,6 +125,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         inline void mainSleep(std::unique_lock<std::mutex>& lock);
         void wakeupMain();
         void addTask(const TaskID task_id, IRunnable* runnable, int num_total_tasks);
+        void activateReadyTasks();
 
     public:
         TaskSystemParallelThreadPoolSleeping(int num_threads);

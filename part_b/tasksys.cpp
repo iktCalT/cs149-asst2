@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define DEBUG_1 0
@@ -434,6 +435,35 @@ void TaskSystemParallelThreadPoolSleeping::wakeupMain() {
     main_cv.notify_one(); // Notify main thread that all threads are sleeping
 }
 
+// Move working tasks set members to finished tasks set. 
+// And move tasks ready to perform from pending tasks set to working tasks set
+void TaskSystemParallelThreadPoolSleeping::activateReadyTasks() {
+    // All work in task is done, add new works to tasks
+    for (const auto& task : tasks) {
+        finished_tasks.emplace(task.first);
+    }
+    tasks.clear(); // Clear tasks list
+
+    for (auto it = pending_tasks.begin(); it != pending_tasks.end();) {
+        bool can_add = true;
+        for (TaskID dep : it->second.deps) {
+            if (finished_tasks.find(dep) == finished_tasks.end()) { // C++11 doesn't support contains()
+                can_add = false;
+                break;
+            }
+        }
+
+        if (can_add) {
+            addTask(it->first, it->second.runnable, it->second.num_total_tasks);
+            it = pending_tasks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    unfinished_tasks.store(tasks.size(), std::memory_order_release);
+}
+
 // Sync, must be called when all threads are sleeping
 void TaskSystemParallelThreadPoolSleeping::sync() {
 
@@ -451,31 +481,8 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
         // due to stealDoWork's unfinished_tasks.fetch_add(1)
         std::unique_lock<std::mutex> lock(sync_mtx);
         mainSleep(lock);
-
-        // All work in task is done, add new works to tasks
-        for (const auto& task : tasks) {
-            finished_tasks.emplace(task.first);
-        }
-        tasks.clear(); // Clear tasks list
-
-        for (auto it = pending_tasks.begin(); it != pending_tasks.end();) {
-            bool can_add = true;
-            for (TaskID dep : it->second.deps) {
-                if (finished_tasks.find(dep) == finished_tasks.end()) { // C++11 doesn't support contains()
-                    can_add = false;
-                    break;
-                }
-            }
-
-            if (can_add) {
-                addTask(it->first, it->second.runnable, it->second.num_total_tasks);
-                it = pending_tasks.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        unfinished_tasks.store(tasks.size(), std::memory_order_release);
+        
+        activateReadyTasks();
         lock.unlock();
 
         wakeupWorker(); // Tell workers that you have new work to do
