@@ -184,6 +184,9 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
                 printf("Joined worker %d...\n", thread_id);
             #endif
         }
+
+    for (auto& task : tasks)
+        delete task.second;
 }
 
 void TaskSystemParallelThreadPoolSleeping::finishWork(Task* task, int thread_id) {
