@@ -109,13 +109,12 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         std::vector<std::thread> workers;
         std::atomic<bool> exit{false};           // Only main thread can modify it
         
-        TaskID new_task_id;                         // If new task is created, use this id. 
+        TaskID new_task_id = 0;                     // If new task is created, use this id. 
                                                     // Only main thread can access it
         std::unordered_map<TaskID, Task*> tasks;    // tasks only store task pointers. 
                                                     // So that when we add new task to
                                                     // tasks, other tasks won't be affected
         std::unordered_map<TaskID, PendingTask> pending_tasks;
-        // std::unordered_set<TaskID> finished_tasks;
         std::atomic<int> unfinished_tasks{0};    // Number of unfinished bunch of tasks
 
         std::condition_variable worker_cv;          // Worker threads sleep / wakeup

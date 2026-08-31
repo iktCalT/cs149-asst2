@@ -7,3 +7,4 @@ tutorial/output/tutorial.dSYM/Contents/Resources/DWARF/tutorial
 tutorial/output/tutorial
 part_b/runtasks.dSYM/Contents/Info.plist
 part_b/runtasks.dSYM/Contents/Resources/Relocations/aarch64/runtasks.yml
+part_b/compile_commands.json
