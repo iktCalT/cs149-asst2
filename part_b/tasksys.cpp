@@ -11,12 +11,6 @@
 #include <utility>
 #include <vector>
 
-#define DEBUG_1 0
-#define DEBUG_2 0
-#define DEBUG_3 0
-#define DEBUG_4 0
-#define DEBUG_5 0
-
 IRunnable::~IRunnable() {}
 
 ITaskSystem::ITaskSystem(int num_threads) {}
@@ -175,15 +169,8 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     }
 
     for (int thread_id = 0; thread_id < num_threads; ++thread_id)
-        if (workers[thread_id].joinable()) {
-            #if DEBUG_4
-                printf("Joining worker %d...\n", thread_id);
-            #endif
+        if (workers[thread_id].joinable())
             workers[thread_id].join();
-            #if DEBUG_4
-                printf("Joined worker %d...\n", thread_id);
-            #endif
-        }
 
     for (auto& task : tasks)
         delete task.second;
@@ -203,10 +190,7 @@ void TaskSystemParallelThreadPoolSleeping::finishWork(Task* task, int thread_id)
         if (task->work_queues[thread_id].start == task->work_queues[thread_id].end)
             if (task->unfinished->fetch_sub(1, std::memory_order_release) == 1)
                 unfinished_tasks.fetch_sub(1, std::memory_order_release);
-    #if DEBUG_1
-        printf("Task %p: thread %d is running %p, sub_task_id: %d, num_total_tasks: %d\n", 
-            task->runnable, thread_id, task->runnable, sub_task_id, task->num_total_tasks);
-    #endif
+
         // unlock before executing tasks
         task->work_queues[thread_id].lock.unlock();
 
@@ -257,17 +241,6 @@ void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id
         task->work_queues[thread_id].start = start + 1;
         task->work_queues[thread_id].lock.unlock();
 
-    #if DEBUG_3
-        printf("Thread %d is stealing %d/%d tasks from thread %d\n\tStealer becomes [%d, %d). Victim from [%d, %d) to [%d, %d)\n", 
-        thread_id, (size + 1) / 2, size, victim, 
-        start, end, 
-        end - size, end, 
-        end - size, end - (size + 1) / 2);
-    #endif
-    #if DEBUG_1
-        printf("\tTask %p: stealer %d is running %d\n", task->runnable, thread_id, start);
-    #endif
-
         // Do one work immediately after stealing
         task->runnable->runTask(start, task->num_total_tasks);
         break;
@@ -277,26 +250,15 @@ void TaskSystemParallelThreadPoolSleeping::stealDoWork(Task* task, int thread_id
 void TaskSystemParallelThreadPoolSleeping::workerStart(int thread_id) {
     while (true) {
         // Sleep if all tasks are done
-        #if DEBUG_1
-            printf("unfinished_tasks: %d\n", unfinished_tasks.load(std::memory_order_acquire));
-        #endif
         if (unfinished_tasks.load(std::memory_order_acquire) == 0)
             workerSleep();
 
-        if (exit.load(std::memory_order_acquire)) {
-        #if DEBUG_4
-            printf("Worker %d exiting\n", thread_id);
-        #endif
+        if (exit.load(std::memory_order_acquire)) 
             return;
-        }
 
         // Finish all my work (from different tasks)
-        for (auto[task_id, task] : tasks) {
-        #if DEBUG_1
-            printf("Calling finishWork(%p, %d)\n", task, thread_id);
-        #endif
+        for (auto[task_id, task] : tasks)
             finishWork(task, thread_id);
-        }
 
         // Steal work from the first unfinished runnable_task, and finish it
         for (auto[task_id, task] : tasks) {
@@ -308,9 +270,6 @@ void TaskSystemParallelThreadPoolSleeping::workerStart(int thread_id) {
 
 // Worker starts sleeping -> can only be called by workers
 void TaskSystemParallelThreadPoolSleeping::workerSleep() {
-#if DEBUG_4
-    printf("Worker sleep\n");
-#endif
     std::unique_lock<std::mutex> lock(sync_mtx);
 
     if (exit.load(std::memory_order_acquire)) return;
@@ -331,16 +290,10 @@ void TaskSystemParallelThreadPoolSleeping::workerSleep() {
     // enter next run and finish all tasks, quickly. exit becomes true.
     // This thread may still think that exit is false, and start
     // finishWork and stealDoWork, then sleep, never exit
-#if DEBUG_4
-    printf("Worker waken up\n");
-#endif
 }
 
 // Wakeup workers -> can only be called by main thread
 void TaskSystemParallelThreadPoolSleeping::wakeupWorker() {
-#if DEBUG_4
-    printf("Try to wakeup workers\n");
-#endif
     // When tasks are prepared, notify all sleeping threads to start working
     worker_cv.notify_all(); // Workers start working
 }
@@ -354,9 +307,6 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     // tasks sequentially on the calling thread.
     //
 
-#if DEBUG_2
-    printf("run() called. Runnable: %p, num_total_tasks: %d\n", runnable, num_total_tasks);
-#endif
     runAsyncWithDeps(runnable, num_total_tasks, {});
     sync();
 }
@@ -372,21 +322,11 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
     TaskID task_id = new_task_id++;
     // C++ 11 doesn't support try_emplace
     pending_tasks.emplace(task_id, PendingTask(runnable, num_total_tasks, deps));
-#if DEBUG_2
-    printf("runWithAsync() called. Runnable: %p, num_total_tasks: %d, deps: ", runnable, num_total_tasks);
-    for (TaskID task_id : deps)
-        printf("%d ", task_id);
-    printf("\n");
-#endif
     return task_id;
 }
 
 // When all workers are sleeping and waiting for work, this function is called
 void TaskSystemParallelThreadPoolSleeping::addTask(TaskID pending_id, PendingTask& pending_task) {
-    
-#if DEBUG_4
-    printf("addTask() called. task_id: %d, runnable: %p, num_total_tasks: %d\n", pending_id, pending_task.runnable, pending_task.num_total_tasks);
-#endif
     int tasks_per_thread = (pending_task.num_total_tasks + num_threads-1) / num_threads;
     // Work queue is [task.first, task.second)
     int active_queue = 0;
@@ -414,28 +354,14 @@ void TaskSystemParallelThreadPoolSleeping::mainSleep() {
 
 inline void TaskSystemParallelThreadPoolSleeping::mainSleep(std::unique_lock<std::mutex>& lock) {
     // If not finish, block the main
-#if DEBUG_4
-    printf("Main sleep\n");
-#endif
     main_cv.wait(lock, 
         [this]{
-        #if DEBUG_4
-            printf("Unfinished tasks: %d, non-sleeping workers: %d\n", 
-                unfinished_tasks.load(std::memory_order_relaxed), 
-                num_threads - sleep_cnt);
-        #endif
             return unfinished_tasks.load(std::memory_order_acquire) == 0 &&
                                             sleep_cnt == num_threads;});
                 // When all tasks are done and all threads are sleeping, wake up
-#if DEBUG_4
-    printf("Main waken up\n");
-#endif
 }
 
 void TaskSystemParallelThreadPoolSleeping::wakeupMain() {
-#if DEBUG_4
-    printf("Try to wakeup main\n");
-#endif
     main_cv.notify_one(); // Notify main thread that all threads are sleeping
 }
 
@@ -454,21 +380,6 @@ void TaskSystemParallelThreadPoolSleeping::buildDependents() {
             }
         }
     }
-
-#if DEBUG_5
-    printf("All deps: \n");
-    for (auto task : pending_tasks) {
-        printf("Task id: %d\n\tUpstream: ", task.first);
-        for (auto up : task.second.upstream) {
-            printf("%d, ", up);
-        }
-        printf("\n\tDownstream: ");
-        for (auto down : task.second.downstream) {
-            printf("%d, ", down);
-        }
-        printf("\n");
-    }
-#endif
 }
 
 void TaskSystemParallelThreadPoolSleeping::activateInitTasks() {
@@ -481,12 +392,6 @@ void TaskSystemParallelThreadPoolSleeping::activateInitTasks() {
         }
     }
     unfinished_tasks.store(tasks.size(), std::memory_order_release);
-
-#if DEBUG_5
-    printf("Handling tasks: ");
-    for (auto task : tasks) printf("%d, ", task.first);
-    printf("\n");
-#endif
 }
 
 // Move tasks ready to perform from pending tasks set to working tasks set
@@ -524,9 +429,6 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
     // TODO: CS149 students will modify the implementation of this method in Part B.
     //
 
-#if DEBUG_4
-    printf("sync() called\n");
-#endif
     mainSleep(); // Make sure to run sync() when all worker threads are sleeping
     buildDependents();
 
